@@ -554,14 +554,16 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
+        cache_layer_idx: int | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
+        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = cache_params is not None and cache_params.has_previous_state(
-            self.layer_idx, state_idx=0
+            cache_layer_idx, state_idx=0
         )
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -573,8 +575,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
-            conv_state = cache_params.layers[self.layer_idx].conv_states[0]
+        if use_precomputed_states and seq_len == 1 and not cache_params.layers[cache_layer_idx].record_past:
+            conv_state = cache_params.layers[cache_layer_idx].conv_states[0]
             # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
@@ -586,7 +588,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             if cache_params is not None:
                 mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
+                    mixed_qkv, cache_layer_idx, conv_kernel_size=self.conv_kernel_size
                 )
 
             mixed_qkv = causal_conv1d_fn(
@@ -623,7 +625,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
+        recurrent_state = cache_params.layers[cache_layer_idx].recurrent_states[0] if use_precomputed_states else None
         if use_precomputed_states and seq_len == 1:
             core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
                 query,
@@ -653,7 +655,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         # Update cache
         if cache_params is not None:
-            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+            cache_params.update_recurrent_state(last_recurrent_state, cache_layer_idx)
 
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
@@ -783,8 +785,10 @@ class Qwen3_5MoeAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
+        cache_layer_idx: int | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -801,7 +805,7 @@ class Qwen3_5MoeAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            key_states, value_states = past_key_values.update(key_states, value_states, cache_layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -964,6 +968,8 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
+        cache_layer_idx: int | None = None,
+        loop_scale: float = 1.0,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
@@ -976,6 +982,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 attention_mask=attention_mask,
+                cache_layer_idx=cache_layer_idx,
                 **kwargs,
             )
         elif self.block_type == "full_attention":
@@ -986,10 +993,11 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 position_embeddings=position_embeddings,
+                cache_layer_idx=cache_layer_idx,
                 **kwargs,
             )
 
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states * loop_scale
 
         # Fully Connected
         residual = hidden_states
@@ -998,7 +1006,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         # For the MoE layers, we need to unpack
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states * loop_scale
 
         return hidden_states
 
@@ -1341,8 +1349,15 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.looped_layers = self.get_looped_layers()
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_looped_layers(self) -> list[int]:
+        looped_layers = list(range(self.config.num_hidden_layers))
+        if self.config.loop_start is not None and self.config.loop_end is not None:
+            looped_layers[self.config.loop_start : self.config.loop_end] *= self.config.loop_iterations
+        return looped_layers
 
     @merge_with_config_defaults
     @capture_outputs
@@ -1398,13 +1413,23 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        for cache_layer_idx, layer_idx in enumerate(self.looped_layers):
+            decoder_layer = self.layers[layer_idx]
+            loop_scale = (
+                self.config.loop_scale
+                if self.config.loop_start is not None
+                and self.config.loop_end is not None
+                and self.config.loop_start <= layer_idx < self.config.loop_end
+                else 1.0
+            )
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
-                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+                attention_mask=causal_mask_mapping[decoder_layer.block_type],
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
+                cache_layer_idx=cache_layer_idx,
+                loop_scale=loop_scale,
                 use_cache=use_cache,
                 **kwargs,
             )
