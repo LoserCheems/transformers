@@ -17,6 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+
 from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig, remap_legacy_layer_types
@@ -38,6 +40,14 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
         Number of key heads used in linear attention layers.
     linear_num_value_heads (`int`, *optional*, defaults to 32):
         Number of value heads used in linear attention layers.
+    loop_start (`int`, *optional*, defaults to 10):
+        Index of the first looped layer.
+    loop_end (`int`, *optional*, defaults to 30):
+        Index after the last looped layer.
+    loop_iterations (`int`, *optional*, defaults to 2):
+        Number of times to execute the looped layers.
+    loop_scale (`float`, *optional*, defaults to 0.5):
+        Scale applied to the attention and MLP outputs of looped layers.
 
     ```python
     >>> from transformers import Qwen3_5MoeTextModel, Qwen3_5MoeTextConfig
@@ -114,6 +124,10 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
     output_router_logits: bool = False
     router_aux_loss_coef: float = 0.001
     layer_types: list[str] | None = None
+    loop_start: int | None = 10
+    loop_end: int | None = 30
+    loop_iterations: int = 2
+    loop_scale: float = 0.5
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
@@ -132,6 +146,14 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
             self.layer_types = remap_legacy_layer_types(self.layer_types)
 
         super().__post_init__(**kwargs)
+
+    def get_text_config(self, decoder=None, encoder=None):
+        config = super().get_text_config(decoder=decoder, encoder=encoder)
+        if decoder and self.loop_start is not None and self.loop_end is not None:
+            config = copy.copy(config)
+            config.layer_types = config.layer_types.copy()
+            config.layer_types[self.loop_start : self.loop_end] *= self.loop_iterations
+        return config
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3.5-35B-A3B")
@@ -211,6 +233,10 @@ class Qwen3_5MoeConfig(PreTrainedConfig):
             self.text_config = self.sub_configs["text_config"]()
 
         super().__post_init__(**kwargs)
+
+    def get_text_config(self, decoder=None, encoder=None):
+        config = super().get_text_config(decoder=decoder, encoder=encoder)
+        return config.get_text_config(decoder=decoder, encoder=encoder) if config is not self else config
 
 
 __all__ = ["Qwen3_5MoeConfig", "Qwen3_5MoeTextConfig", "Qwen3_5MoeVisionConfig"]
